@@ -4,3 +4,6 @@
 build/
 .vscode/
 .idea/
+
+# PCB 和硬件模块资料只留在本地
+hardware/
