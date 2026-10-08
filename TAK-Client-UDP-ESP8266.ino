@@ -19,7 +19,7 @@
        群聊走 224.10.10.1:17012，私聊走单播 UDP 17012
     4. 浏览器打开 http://192.168.4.1 可改呼号、小队颜色和角色，保存后一直有效
 
-  本机没有 GPS，坐标写在 DEVICE_LAT / DEVICE_LON。
+  本机没有 GPS。经纬度可在配置页修改，未保存时默认为 31.230416, 121.473701。
   时钟在收到第一条带时间的 ATAK 报文后自动对齐，
   对齐前发出的位置会被 ATAK 当成过期数据丢掉。
 
@@ -28,7 +28,9 @@
   聊天正文里出现 Roger 会闪板载灯，出现 callRESTART 会重启。
   私聊里出现“开灯 / 打开灯 / turn on”等文字时 IO5 输出高电平，并回复“收到，已开灯”；
   出现“关灯 / 关闭灯 / 关掉灯 / turn off”等文字时 IO5 输出低电平，并回复“收到，已关灯”。
-  其他私聊内容只回复“收到”。回复发回对方的 UDP 17012。
+  其他私聊内容只回复“收到”。私聊发送“状态”时，回复呼号、小队、角色、经纬度、灯的开关和运行时间。
+  回复发回对方的 UDP 17012。
+  IO4 接按键，另一端接 GND。按下后向最近一次私聊对象发送“你好”。
 */
 
 #include <ESP8266WiFi.h>
@@ -60,9 +62,9 @@ static const uint16_t CHAT_PORT = 17012;
 static const uint32_t SEND_INTERVAL_MS = 5000;
 static const time_t STALE_AFTER_SEC = 45;
 
-// 没有 GPS。改成你希望在 ATAK 地图上出现的坐标。
-static const double DEVICE_LAT = 31.230416;
-static const double DEVICE_LON = 121.473701;
+// 没有 GPS。未在网页保存坐标时使用。
+static char cfgLat[16] = "31.230416";
+static char cfgLon[16] = "121.473701";
 static const char* DEVICE_HAE = "0.0";
 
 // 没保存过配置时使用。之后以网页里保存的为准。
@@ -74,7 +76,8 @@ static char cfgRole[24] = "Team Member";
 static const time_t BOOT_UNIX = 1791244800;
 
 static const int RX_MAX = 1460;
-static const int LAMP_PIN = 5;  // IO5，高电平亮，低电平灭
+static const int LAMP_PIN = 5;     // IO5，高电平亮，低电平灭
+static const int BUTTON_PIN = 4;   // IO4，按键另一端接 GND，内部上拉
 
 // -------------------- 运行状态 --------------------
 static WiFiUDP rxUdp;
@@ -91,6 +94,10 @@ static uint32_t nextSendMs = 0;
 static uint32_t nextJoinMs = 0;
 static uint32_t ledOffAt = 0;
 static uint8_t lastClients = 0;
+static IPAddress lastPeerIp;
+static char lastPeerCallsign[32] = "ATAK";
+static char lastPeerUid[48] = "ATAK";
+static bool hasLastPeer = false;
 
 // -------------------- 时间 --------------------
 static time_t civilToUnix(int y, int m, int d, int hh, int mm, int ss) {
@@ -181,13 +188,8 @@ static bool sendSa() {
     return false;
   }
 
-  char lat[16];
-  char lon[16];
   char nowText[32];
   char staleText[32];
-  dtostrf(DEVICE_LAT, 1, 6, lat);
-  dtostrf(DEVICE_LON, 1, 6, lon);
-
   time_t now = currentUnix();
   formatCotTime(nowText, sizeof(nowText), now);
   formatCotTime(staleText, sizeof(staleText), now + STALE_AFTER_SEC);
@@ -207,7 +209,7 @@ static bool sendSa() {
       "<status battery=\"100\"/>"
       "<track course=\"0.0\" speed=\"0.0\"/>"
       "</detail></event>",
-      deviceUid, nowText, nowText, staleText, lat, lon, DEVICE_HAE, cfgCallsign,
+      deviceUid, nowText, nowText, staleText, cfgLat, cfgLon, DEVICE_HAE, cfgCallsign,
       AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3], (unsigned)CHAT_PORT, cfgCallsign, cfgTeam, cfgRole);
 
   if (len <= 0 || len >= (int)sizeof(cot)) {
@@ -225,7 +227,7 @@ static bool sendSa() {
     return false;
   }
 
-  Serial.printf("已发送 %s  %s,%s  %s  客户端 %u\n", cfgCallsign, lat, lon,
+  Serial.printf("已发送 %s  %s,%s  %s  客户端 %u\n", cfgCallsign, cfgLat, cfgLon,
                 clockSynced ? "已对时" : "未对时", WiFi.softAPgetStationNum());
   return true;
 }
@@ -650,19 +652,15 @@ static bool extractAndroidUid(const uint8_t* data, int len, char* out, size_t ou
 }
 
 static bool sendChatReply(const IPAddress& to, const char* text, const char* peerCallsign, const char* peerUid) {
-  char lat[16];
-  char lon[16];
   char nowText[32];
   char staleText[32];
   char eventUid[72];
-  dtostrf(DEVICE_LAT, 1, 6, lat);
-  dtostrf(DEVICE_LON, 1, 6, lon);
   time_t now = currentUnix();
   formatCotTime(nowText, sizeof(nowText), now);
   formatCotTime(staleText, sizeof(staleText), now + 120);
   snprintf(eventUid, sizeof(eventUid), "GeoChat.%s.%lu", deviceUid, (unsigned long)millis());
 
-  static char cot[900];
+  static char cot[1200];
   int len = snprintf(
       cot, sizeof(cot),
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
@@ -675,7 +673,7 @@ static bool sendChatReply(const IPAddress& to, const char* text, const char* pee
       "<link uid=\"%s\" type=\"a-f-G-U-C\" relation=\"p-p\"/>"
       "<remarks source=\"BAO.F.ESP.%s\" to=\"%s\" time=\"%s\">%s</remarks>"
       "</detail></event>",
-      eventUid, nowText, nowText, staleText, lat, lon, DEVICE_HAE, peerCallsign, peerUid, cfgCallsign, deviceUid,
+      eventUid, nowText, nowText, staleText, cfgLat, cfgLon, DEVICE_HAE, peerCallsign, peerUid, cfgCallsign, deviceUid,
       peerUid, peerUid, deviceUid, deviceUid, peerUid, nowText, text);
 
   if (len <= 0 || len >= (int)sizeof(cot)) {
@@ -699,6 +697,34 @@ static bool sendChatReply(const IPAddress& to, const char* text, const char* pee
   return true;
 }
 
+static void formatUptime(char* out, size_t outLen) {
+  uint32_t sec = millis() / 1000UL;
+  uint32_t days = sec / 86400UL;
+  sec %= 86400UL;
+  uint32_t hours = sec / 3600UL;
+  sec %= 3600UL;
+  uint32_t mins = sec / 60UL;
+  sec %= 60UL;
+  snprintf(out, outLen, "%lu天%lu小时%lu分%lu秒", (unsigned long)days, (unsigned long)hours, (unsigned long)mins,
+           (unsigned long)sec);
+}
+
+static void buildStatus(char* out, size_t outLen) {
+  char uptime[40];
+  formatUptime(uptime, sizeof(uptime));
+  snprintf(out, outLen, "呼号：%s\n小队：%s\n角色：%s\n位置：%s,%s\n灯：%s\n运行：%s", cfgCallsign, cfgTeam, cfgRole,
+           cfgLat, cfgLon, digitalRead(LAMP_PIN) == HIGH ? "开" : "关", uptime);
+}
+
+static void rememberPeer(const IPAddress& ip, const char* callsign, const char* uid) {
+  lastPeerIp = ip;
+  strncpy(lastPeerCallsign, callsign, sizeof(lastPeerCallsign) - 1);
+  strncpy(lastPeerUid, uid, sizeof(lastPeerUid) - 1);
+  lastPeerCallsign[sizeof(lastPeerCallsign) - 1] = '\0';
+  lastPeerUid[sizeof(lastPeerUid) - 1] = '\0';
+  hasLastPeer = true;
+}
+
 static void replyPrivateChat(const IPAddress& to, const uint8_t* data, int len, int lamp) {
   char peerCallsign[32];
   char peerUid[48];
@@ -712,6 +738,14 @@ static void replyPrivateChat(const IPAddress& to, const uint8_t* data, int len, 
   if (!extractAndroidUid(data, len, peerUid, sizeof(peerUid))) {
     snprintf(peerUid, sizeof(peerUid), "ATAK");
   }
+  rememberPeer(to, peerCallsign, peerUid);
+
+  if (findBytes((const char*)data, len, "状态") != nullptr) {
+    char status[220];
+    buildStatus(status, sizeof(status));
+    sendChatReply(to, status, peerCallsign, peerUid);
+    return;
+  }
 
   const char* text = "收到";
   if (lamp > 0) {
@@ -720,6 +754,31 @@ static void replyPrivateChat(const IPAddress& to, const uint8_t* data, int len, 
     text = "收到，已关灯";
   }
   sendChatReply(to, text, peerCallsign, peerUid);
+}
+
+static void sendHello() {
+  if (!hasLastPeer || lastPeerIp == IPAddress(0, 0, 0, 0)) {
+    Serial.println("还没有私聊对象，未发送你好");
+    return;
+  }
+  sendChatReply(lastPeerIp, "你好", lastPeerCallsign, lastPeerUid);
+}
+
+static void serviceButton() {
+  static int stable = HIGH;
+  static int lastRead = HIGH;
+  static uint32_t changedAt = 0;
+  int reading = digitalRead(BUTTON_PIN);
+  if (reading != lastRead) {
+    changedAt = millis();
+    lastRead = reading;
+  }
+  if ((int32_t)(millis() - changedAt) > 40 && reading != stable) {
+    stable = reading;
+    if (stable == LOW) {
+      sendHello();
+    }
+  }
 }
 
 static void receiveOn(WiFiUDP& udp, const char* channel, bool chatPort) {
@@ -795,6 +854,8 @@ struct CfgBlob {
   char callsign[24];
   char team[16];
   char role[24];
+  char lat[16];
+  char lon[16];
 };
 
 static const char* TEAM_VALUES[] = {"White",     "Yellow", "Orange", "Magenta", "Red",     "Maroon",
@@ -819,6 +880,37 @@ static bool knownOpt(const char* value, const char* const* values, int count) {
     }
   }
   return false;
+}
+
+static bool validCoord(const char* s, double minV, double maxV) {
+  if (s == nullptr || s[0] == '\0' || strlen(s) > 15) {
+    return false;
+  }
+  bool dot = false;
+  bool digit = false;
+  for (size_t i = 0; s[i] != '\0'; i++) {
+    char c = s[i];
+    if (i == 0 && (c == '-' || c == '+')) {
+      continue;
+    }
+    if (c == '.') {
+      if (dot) {
+        return false;
+      }
+      dot = true;
+      continue;
+    }
+    if (c >= '0' && c <= '9') {
+      digit = true;
+      continue;
+    }
+    return false;
+  }
+  if (!digit) {
+    return false;
+  }
+  double value = atof(s);
+  return value >= minV && value <= maxV;
 }
 
 static bool validCallsign(const char* s) {
@@ -863,6 +955,8 @@ static void loadConfig() {
   blob.callsign[sizeof(blob.callsign) - 1] = '\0';
   blob.team[sizeof(blob.team) - 1] = '\0';
   blob.role[sizeof(blob.role) - 1] = '\0';
+  blob.lat[sizeof(blob.lat) - 1] = '\0';
+  blob.lon[sizeof(blob.lon) - 1] = '\0';
   if (blob.magic != CFG_MAGIC || !validCallsign(blob.callsign) ||
       !knownOpt(blob.team, TEAM_VALUES, TEAM_COUNT) || !knownOpt(blob.role, ROLE_VALUES, ROLE_COUNT)) {
     return;
@@ -873,6 +967,12 @@ static void loadConfig() {
   cfgCallsign[sizeof(cfgCallsign) - 1] = '\0';
   cfgTeam[sizeof(cfgTeam) - 1] = '\0';
   cfgRole[sizeof(cfgRole) - 1] = '\0';
+  if (validCoord(blob.lat, -90.0, 90.0) && validCoord(blob.lon, -180.0, 180.0)) {
+    strncpy(cfgLat, blob.lat, sizeof(cfgLat) - 1);
+    strncpy(cfgLon, blob.lon, sizeof(cfgLon) - 1);
+    cfgLat[sizeof(cfgLat) - 1] = '\0';
+    cfgLon[sizeof(cfgLon) - 1] = '\0';
+  }
 }
 
 static void saveConfig() {
@@ -881,6 +981,8 @@ static void saveConfig() {
   strncpy(blob.callsign, cfgCallsign, sizeof(blob.callsign) - 1);
   strncpy(blob.team, cfgTeam, sizeof(blob.team) - 1);
   strncpy(blob.role, cfgRole, sizeof(blob.role) - 1);
+  strncpy(blob.lat, cfgLat, sizeof(blob.lat) - 1);
+  strncpy(blob.lon, cfgLon, sizeof(blob.lon) - 1);
   EEPROM.put(0, blob);
   EEPROM.commit();
 }
@@ -903,7 +1005,7 @@ button{margin-top:18px;background:#137a5a;border:0}
 
 static const char PAGE_ERR[] PROGMEM =
     "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"></head><body>"
-    "<p>呼号、小队颜色或角色无效。呼号最多 20 字节，不能含 &lt; &gt; &amp; 引号。</p>"
+    "<p>呼号、小队颜色、角色或经纬度无效。呼号最多 20 字节，纬度 -90 到 90，经度 -180 到 180。</p>"
     "<p><a href=\"/\">返回</a></p></body></html>";
 
 static void sendEscaped(const char* s) {
@@ -945,7 +1047,7 @@ static void handleRoot() {
   webServer.send(200, "text/html; charset=utf-8", "");
   webServer.sendContent_P(PAGE_HEAD);
   if (webServer.hasArg("saved")) {
-    webServer.sendContent_P(PSTR("<p class=\"ok\">已保存。下一次位置广播会使用新的呼号、颜色和角色。</p>"));
+    webServer.sendContent_P(PSTR("<p class=\"ok\">已保存。下一次位置广播会使用新的呼号、颜色、角色和坐标。</p>"));
   }
   webServer.sendContent_P(PSTR("<form method=\"POST\" action=\"/save\"><label>呼号</label>"
                                "<input name=\"callsign\" maxlength=\"20\" required value=\""));
@@ -954,7 +1056,11 @@ static void handleRoot() {
   sendSelect("team", cfgTeam, TEAM_VALUES, TEAM_LABELS, TEAM_COUNT);
   webServer.sendContent_P(PSTR("<label>角色</label>"));
   sendSelect("role", cfgRole, ROLE_VALUES, ROLE_LABELS, ROLE_COUNT);
-  webServer.sendContent_P(PSTR("<button type=\"submit\">保存</button></form></main></body></html>"));
+  webServer.sendContent_P(PSTR("<label>纬度</label><input name=\"lat\" required value=\""));
+  sendEscaped(cfgLat);
+  webServer.sendContent_P(PSTR("\"><label>经度</label><input name=\"lon\" required value=\""));
+  sendEscaped(cfgLon);
+  webServer.sendContent_P(PSTR("\"><button type=\"submit\">保存</button></form></main></body></html>"));
   webServer.sendContent("");
 }
 
@@ -973,19 +1079,28 @@ static void handleSave() {
   char callsign[24];
   char team[16];
   char role[24];
+  char lat[16];
+  char lon[16];
   copyArg("callsign", callsign, sizeof(callsign));
   copyArg("team", team, sizeof(team));
   copyArg("role", role, sizeof(role));
-  if (!validCallsign(callsign) || !knownOpt(team, TEAM_VALUES, TEAM_COUNT) || !knownOpt(role, ROLE_VALUES, ROLE_COUNT)) {
+  copyArg("lat", lat, sizeof(lat));
+  copyArg("lon", lon, sizeof(lon));
+  if (!validCallsign(callsign) || !knownOpt(team, TEAM_VALUES, TEAM_COUNT) || !knownOpt(role, ROLE_VALUES, ROLE_COUNT) ||
+      !validCoord(lat, -90.0, 90.0) || !validCoord(lon, -180.0, 180.0)) {
     webServer.send_P(400, PSTR("text/html; charset=utf-8"), PAGE_ERR);
     return;
   }
   strncpy(cfgCallsign, callsign, sizeof(cfgCallsign) - 1);
   strncpy(cfgTeam, team, sizeof(cfgTeam) - 1);
   strncpy(cfgRole, role, sizeof(cfgRole) - 1);
+  strncpy(cfgLat, lat, sizeof(cfgLat) - 1);
+  strncpy(cfgLon, lon, sizeof(cfgLon) - 1);
   cfgCallsign[sizeof(cfgCallsign) - 1] = '\0';
   cfgTeam[sizeof(cfgTeam) - 1] = '\0';
   cfgRole[sizeof(cfgRole) - 1] = '\0';
+  cfgLat[sizeof(cfgLat) - 1] = '\0';
+  cfgLon[sizeof(cfgLon) - 1] = '\0';
   saveConfig();
   nextSendMs = millis();
   webServer.sendHeader("Location", "/?saved=1", true);
@@ -1004,6 +1119,7 @@ void setup() {
   digitalWrite(LED_BUILTIN, HIGH);
   pinMode(LAMP_PIN, OUTPUT);
   digitalWrite(LAMP_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
   delay(200);
@@ -1039,6 +1155,7 @@ void setup() {
   Serial.printf("呼号: %s\n", cfgCallsign);
   Serial.printf("小队: %s\n", cfgTeam);
   Serial.printf("角色: %s\n", cfgRole);
+  Serial.printf("坐标: %s,%s\n", cfgLat, cfgLon);
   Serial.printf("UID: %s\n", deviceUid);
   Serial.println("配置页: http://192.168.4.1");
 
@@ -1062,6 +1179,7 @@ void loop() {
     receiveOn(chatUdp, "聊天", true);
   }
   serviceLed();
+  serviceButton();
   trackClients();
   webServer.handleClient();
 
